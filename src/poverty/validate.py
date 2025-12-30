@@ -8,21 +8,23 @@ import pandas as pd
 
 from poverty.data_io import (
     DataPaths,
-    build_train_frame,
-    load_test_features,
-    check_keys_unique,
     basic_schema_report,
+    build_train_frame,
+    check_keys_unique,
+    load_test_features,
     feature_columns,
 )
 from poverty.metrics import score_all_surveys
-from poverty.models import fit_predict_elasticnet_log, ElasticNetConfig
+from poverty.models import (
+    ElasticNetConfig,
+    HGBConfig,
+    fit_predict_elasticnet_log,
+    fit_predict_hgb_log,
+    WeightMode,
+)
 
 
 def weighted_median(values: np.ndarray, weights: np.ndarray) -> float:
-    """
-    Weighted median used for a constant baseline predictor.
-    This is a sanity-check model to verify the LOSO + scorer plumbing.
-    """
     v = np.asarray(values, dtype=float)
     w = np.asarray(weights, dtype=float)
 
@@ -37,10 +39,6 @@ def weighted_median(values: np.ndarray, weights: np.ndarray) -> float:
 
 
 def loso_constant_baseline(train_df: pd.DataFrame, rates_gt: pd.DataFrame) -> pd.DataFrame:
-    """
-    Leave-one-survey-out (LOSO) evaluation with a constant predictor.
-    For each held-out survey, fit a weighted median on the other surveys and predict that constant.
-    """
     out_rows = []
     surveys = sorted(train_df["survey_id"].unique().tolist())
 
@@ -48,13 +46,10 @@ def loso_constant_baseline(train_df: pd.DataFrame, rates_gt: pd.DataFrame) -> pd
         tr = train_df[train_df["survey_id"] != holdout_sid].copy()
         va = train_df[train_df["survey_id"] == holdout_sid].copy()
 
-        const_pred = weighted_median(
-            tr["cons_ppp17"].to_numpy(),
-            tr["weight"].to_numpy(),
-        )
+        const_pred = weighted_median(tr["cons_ppp17"].to_numpy(), tr["weight"].to_numpy())
         va["y_pred"] = const_pred
 
-        blended, scores = score_all_surveys(
+        _blended, scores = score_all_surveys(
             va,
             rates_gt,
             y_true_col="cons_ppp17",
@@ -76,39 +71,30 @@ def loso_constant_baseline(train_df: pd.DataFrame, rates_gt: pd.DataFrame) -> pd
     return pd.DataFrame(out_rows).sort_values("holdout_survey_id")
 
 
-def loso_elasticnet_baseline(
+def loso_model_eval(
     train_df: pd.DataFrame,
     rates_gt: pd.DataFrame,
-    weight_mode: str,
-    cfg: ElasticNetConfig,
+    *,
+    model_name: str,
+    predict_fn,
 ) -> pd.DataFrame:
-    """
-    Leave-one-survey-out (LOSO) evaluation for ElasticNet on log(cons_ppp17).
-    """
     out_rows = []
     surveys = sorted(train_df["survey_id"].unique().tolist())
-    feat_cols = feature_columns(train_df)
 
     for holdout_sid in surveys:
         tr = train_df[train_df["survey_id"] != holdout_sid].copy()
         va = train_df[train_df["survey_id"] == holdout_sid].copy()
 
-        va["y_pred"] = fit_predict_elasticnet_log(
-            train_df=tr,
-            valid_df=va,
-            feature_cols=feat_cols,
-            weight_mode=weight_mode,
-            cfg=cfg,
-        )
+        y_hat = predict_fn(tr, va)
+        va["y_pred"] = y_hat
 
-        blended, scores = score_all_surveys(
+        _blended, scores = score_all_surveys(
             va,
             rates_gt,
             y_true_col="cons_ppp17",
             y_pred_col="y_pred",
             weight_col="weight",
         )
-
         s = scores[0]
         out_rows.append(
             {
@@ -116,7 +102,7 @@ def loso_elasticnet_baseline(
                 "poverty_wmape": s.poverty_wmape,
                 "household_mape": s.household_mape,
                 "blended": s.blended,
-                "model": f"elasticnet_log({weight_mode})",
+                "model": model_name,
             }
         )
 
@@ -124,40 +110,86 @@ def loso_elasticnet_baseline(
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--data-dir",
-        type=str,
-        required=True,
-        help="Path to data/raw directory containing the CSVs.",
-    )
+    parser = argparse.ArgumentParser(prog="poverty.validate")
+    parser.add_argument("--data-dir", type=str, required=True)
+
+    parser.add_argument("--run-elasticnet", action="store_true")
+    parser.add_argument("--run-hgb", action="store_true")
+
+    parser.add_argument("--weight-mode", type=str, default="none", choices=["none", "weight", "sqrt_weight"])
+
+    # ElasticNet args
+    parser.add_argument("--alpha", type=float, default=0.01)
+    parser.add_argument("--l1-ratio", type=float, default=0.2)
+
+    # HGB args
+    parser.add_argument("--hgb-max-iter", type=int, default=400)
+    parser.add_argument("--hgb-learning-rate", type=float, default=0.05)
+    parser.add_argument("--hgb-max-depth", type=int, default=6)
+    parser.add_argument("--hgb-min-samples-leaf", type=int, default=20)
+    parser.add_argument("--hgb-l2", type=float, default=0.0)
+    parser.add_argument("--hgb-early-stopping", action="store_true")
+
     args = parser.parse_args()
 
-    paths = DataPaths(data_dir=Path(args.data_dir))
+    # Default behavior: if neither flag set, run both
+    if not args.run_elasticnet and not args.run_hgb:
+        args.run_elasticnet = True
+        args.run_hgb = True
 
+    paths = DataPaths(data_dir=Path(args.data_dir))
     train_df = build_train_frame(paths)
-    test_df = load_test_features(paths)
+    _test_df = load_test_features(paths)
 
     check_keys_unique(train_df)
-    check_keys_unique(test_df)
+    check_keys_unique(_test_df)
 
-    rep = basic_schema_report(train_df, test_df)
+    rep = basic_schema_report(train_df, _test_df)
     print("Schema report:", rep)
 
     rates_gt = pd.read_csv(paths.train_rates).set_index("survey_id").sort_index()
+    feat_cols = feature_columns(train_df)
 
     print("\nRunning LOSO constant baseline (sanity check)...")
     loso = loso_constant_baseline(train_df, rates_gt)
     print(loso.to_string(index=False))
 
-    print("\nRunning LOSO ElasticNet baseline...")
-    cfg = ElasticNetConfig(alpha=0.01, l1_ratio=0.2, max_iter=5000, random_state=42)
-    for wm in ["none", "weight", "sqrt_weight"]:
-        loso_en = loso_elasticnet_baseline(train_df, rates_gt, weight_mode=wm, cfg=cfg)
-        print(f"\nElasticNet weight_mode={wm}")
-        print(loso_en.to_string(index=False))
+    weight_mode: WeightMode = args.weight_mode  # type: ignore[assignment]
 
-    print("\nDone. Next step: add a stronger tree model and calibration.")
+    if args.run_elasticnet:
+        print("\nRunning LOSO ElasticNet baseline...")
+        en_cfg = ElasticNetConfig(alpha=args.alpha, l1_ratio=args.l1_ratio)
+        df_en = loso_model_eval(
+            train_df,
+            rates_gt,
+            model_name=f"elasticnet_log({weight_mode})",
+            predict_fn=lambda tr, va: fit_predict_elasticnet_log(
+                tr, va, feat_cols, weight_mode=weight_mode, cfg=en_cfg
+            ),
+        )
+        print(df_en.to_string(index=False))
+
+    if args.run_hgb:
+        print("\nRunning LOSO Boosted Trees baseline (HistGradientBoostingRegressor)...")
+        hgb_cfg = HGBConfig(
+            max_iter=args.hgb_max_iter,
+            learning_rate=args.hgb_learning_rate,
+            max_depth=args.hgb_max_depth,
+            min_samples_leaf=args.hgb_min_samples_leaf,
+            l2_regularization=args.hgb_l2,
+            early_stopping=args.hgb_early_stopping,
+        )
+        df_hgb = loso_model_eval(
+            train_df,
+            rates_gt,
+            model_name=f"hgb_log({weight_mode})",
+            predict_fn=lambda tr, va: fit_predict_hgb_log(
+                tr, va, feat_cols, cfg=hgb_cfg, weight_mode=weight_mode
+            ),
+        )
+        print(df_hgb.to_string(index=False))
+
+    print("\nDone. Next step: iterate HGB hyperparameters and compare against ElasticNet via LOSO + viz.")
 
 
 if __name__ == "__main__":

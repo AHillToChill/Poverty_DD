@@ -9,14 +9,19 @@ import numpy as np
 import pandas as pd
 
 import matplotlib
+
 matplotlib.use("Agg")  # write PNGs without needing a GUI backend
 import matplotlib.pyplot as plt  # noqa: E402
 from matplotlib.ticker import PercentFormatter  # noqa: E402
 
 from poverty.data_io import DataPaths, build_train_frame, feature_columns
 from poverty.metrics import THRESHOLDS, poverty_rates_from_consumption, score_all_surveys
-from poverty.models import fit_predict_elasticnet_log, ElasticNetConfig
-
+from poverty.models import (
+    ElasticNetConfig,
+    HGBConfig,
+    fit_predict_elasticnet_log,
+    fit_predict_hgb_log,
+)
 
 # Thresholds are approximately ventiles (5%, 10%, ..., 95%) from the reference survey.
 # Used only for visualization aids (metric emphasis band near 40%).
@@ -70,6 +75,38 @@ def make_oof_predictions_elasticnet(
 
     out = pd.concat(parts, axis=0, ignore_index=True)
     model_name = f"elasticnet_log({weight_mode})"
+    return OOFResult(df=out, model_name=model_name)
+
+
+def make_oof_predictions_hgb(
+    train_df: pd.DataFrame,
+    weight_mode: str,
+    cfg: HGBConfig,
+) -> OOFResult:
+    surveys = sorted(train_df["survey_id"].unique().tolist())
+    feat_cols = feature_columns(train_df)
+
+    parts: list[pd.DataFrame] = []
+    for holdout_sid in surveys:
+        tr = train_df[train_df["survey_id"] != holdout_sid].copy()
+        va = train_df[train_df["survey_id"] == holdout_sid].copy()
+
+        y_hat = fit_predict_hgb_log(
+            train_df=tr,
+            test_df=va,
+            feature_cols=feat_cols,
+            config=cfg,
+            weight_mode=weight_mode,
+            y_col="cons_ppp17",
+            weight_col="weight",
+        )
+
+        oof = va[["survey_id", "hhid", "weight", "cons_ppp17"]].copy()
+        oof["y_pred"] = y_hat
+        parts.append(oof)
+
+    out = pd.concat(parts, axis=0, ignore_index=True)
+    model_name = f"hgb_log({weight_mode})"
     return OOFResult(df=out, model_name=model_name)
 
 
@@ -127,7 +164,6 @@ def plot_consumption_pred_vs_true_grid(
 ) -> None:
     _ensure_dir(out_dir)
 
-    # Shared axis limits in original units (log scales), to enable easy comparison.
     y_all = np.concatenate(
         [
             oof["cons_ppp17"].to_numpy(dtype=float),
@@ -158,10 +194,8 @@ def plot_consumption_pred_vs_true_grid(
         ax.set_xlim(lo, hi)
         ax.set_ylim(lo, hi)
 
-        # Identity line
         ax.plot([lo, hi], [lo, hi], linestyle="--", linewidth=1.2, label="Perfect")
 
-        # Simple calibration-by-bins curve (bin by true, plot mean pred)
         bins = np.logspace(np.log10(lo), np.log10(hi), num=14)
         idx = np.digitize(y_true, bins) - 1
         xs, ys = [], []
@@ -187,7 +221,9 @@ def plot_consumption_pred_vs_true_grid(
                 f"blended={m['blended']:.2f}"
             )
             ax.text(
-                0.03, 0.97, txt,
+                0.03,
+                0.97,
+                txt,
                 transform=ax.transAxes,
                 va="top",
                 ha="left",
@@ -221,12 +257,10 @@ def plot_error_ratio_hist_grid(oof: pd.DataFrame, out_dir: Path, model_name: str
         m = np.isfinite(y_true) & np.isfinite(y_pred) & (y_true > 0) & (y_pred > 0)
         ratio = y_pred[m] / y_true[m]
 
-        # Clip extreme ratios for readability, but annotate what we did.
         q_lo, q_hi = np.quantile(ratio, [0.005, 0.995])
         ratio_clip = np.clip(ratio, q_lo, q_hi)
         clipped_frac = float(np.mean((ratio < q_lo) | (ratio > q_hi)))
 
-        # Log-spaced bins for ratio on log axis, centered around 1.
         lo = max(float(np.min(ratio_clip)), 1e-3)
         hi = float(np.max(ratio_clip))
         bins = np.logspace(np.log10(lo), np.log10(hi), 50)
@@ -243,7 +277,9 @@ def plot_error_ratio_hist_grid(oof: pd.DataFrame, out_dir: Path, model_name: str
         p10, p90 = np.quantile(ratio, [0.10, 0.90])
         txt = f"median={med:.2f}\n10–90%=[{p10:.2f}, {p90:.2f}]\nclipped={clipped_frac:.1%}"
         ax.text(
-            0.03, 0.97, txt,
+            0.03,
+            0.97,
+            txt,
             transform=ax.transAxes,
             va="top",
             ha="left",
@@ -317,7 +353,7 @@ def plot_poverty_error_pp_grid(oof: pd.DataFrame, out_dir: Path, model_name: str
         ax.axvline(x_center, linestyle=":", linewidth=1.0)
         ax.axhline(0.0, linestyle="--", linewidth=1.0)
 
-        err_pp = (pred_rates[sid] - true_rates[sid]) * 100.0  # percentage points
+        err_pp = (pred_rates[sid] - true_rates[sid]) * 100.0
         ax.plot(thresholds, err_pp, marker="o", linewidth=1.6)
 
         ax.set_title(f"Survey {sid}", fontsize=12)
@@ -374,6 +410,18 @@ def cmd_oof(args: argparse.Namespace) -> None:
     if args.model == "elasticnet":
         cfg = ElasticNetConfig(alpha=args.alpha, l1_ratio=args.l1_ratio, max_iter=5000, random_state=42)
         res = make_oof_predictions_elasticnet(train_df, weight_mode=args.weight_mode, cfg=cfg)
+
+    elif args.model == "hgb":
+        max_depth = None if args.hgb_max_depth == 0 else int(args.hgb_max_depth)
+        cfg = HGBConfig(
+            max_iter=int(args.hgb_max_iter),
+            learning_rate=float(args.hgb_learning_rate),
+            max_depth=max_depth,
+            min_samples_leaf=int(args.hgb_min_samples_leaf),
+            l2_regularization=float(args.hgb_l2_regularization),
+        )
+        res = make_oof_predictions_hgb(train_df, weight_mode=args.weight_mode, cfg=cfg)
+
     else:
         raise ValueError(f"Unknown model: {args.model}")
 
@@ -382,6 +430,22 @@ def cmd_oof(args: argparse.Namespace) -> None:
     res.df.to_csv(out_path, index=False)
     print(f"Wrote OOF predictions: {out_path}")
     print(f"Model: {res.model_name}")
+
+
+def cmd_metrics(args: argparse.Namespace) -> None:
+    paths = DataPaths(data_dir=Path(args.data_dir))
+    oof = pd.read_csv(args.oof)
+
+    out_dir = Path(args.out_dir)
+    _ensure_dir(out_dir)
+
+    rep = report_metrics(paths, oof)
+    rep.to_csv(out_dir / "metrics_report.csv", index=False)
+    print(rep.to_string(index=False))
+
+    mean_row = rep[rep["survey_id"] == "MEAN"].iloc[0]
+    mean_blended = float(mean_row["blended"])
+    print(f"MEAN_BLENDED={mean_blended:.6f}")
 
 
 def cmd_plots(args: argparse.Namespace) -> None:
@@ -398,7 +462,6 @@ def cmd_plots(args: argparse.Namespace) -> None:
 
     m_by_sid = _metrics_by_survey(rep)
 
-    # Refactored, lower-cognitive-load plot set (4 files total)
     plot_consumption_pred_vs_true_grid(oof, out_dir, model_name=model_name, metrics=m_by_sid)
     plot_error_ratio_hist_grid(oof, out_dir, model_name=model_name)
     plot_poverty_curve_grid(oof, out_dir, model_name=model_name)
@@ -456,12 +519,28 @@ def main() -> None:
 
     p_oof = sub.add_parser("oof", help="Generate out-of-fold (LOSO) predictions for a model.")
     p_oof.add_argument("--data-dir", type=str, required=True)
-    p_oof.add_argument("--model", type=str, default="elasticnet", choices=["elasticnet"])
+    p_oof.add_argument("--model", type=str, default="elasticnet", choices=["elasticnet", "hgb"])
     p_oof.add_argument("--weight-mode", type=str, default="none", choices=["none", "weight", "sqrt_weight"])
+
+    # ElasticNet params
     p_oof.add_argument("--alpha", type=float, default=0.01)
     p_oof.add_argument("--l1-ratio", type=float, default=0.2)
+
+    # HGB params (max-depth: use 0 to mean None)
+    p_oof.add_argument("--hgb-learning-rate", type=float, default=0.05)
+    p_oof.add_argument("--hgb-max-iter", type=int, default=400)
+    p_oof.add_argument("--hgb-max-depth", type=int, default=6)
+    p_oof.add_argument("--hgb-min-samples-leaf", type=int, default=20)
+    p_oof.add_argument("--hgb-l2-regularization", type=float, default=0.0)
+
     p_oof.add_argument("--out", type=str, required=True)
     p_oof.set_defaults(func=cmd_oof)
+
+    p_metrics = sub.add_parser("metrics", help="Compute metrics report from an OOF file (no plots).")
+    p_metrics.add_argument("--data-dir", type=str, required=True)
+    p_metrics.add_argument("--oof", type=str, required=True)
+    p_metrics.add_argument("--out-dir", type=str, required=True)
+    p_metrics.set_defaults(func=cmd_metrics)
 
     p_plots = sub.add_parser("plots", help="Create plots + metrics report from an OOF file.")
     p_plots.add_argument("--data-dir", type=str, required=True)

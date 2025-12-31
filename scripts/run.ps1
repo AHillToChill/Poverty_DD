@@ -1,138 +1,139 @@
-[CmdletBinding()]
 param(
     [string]$DataDir = "data/raw",
 
-    [ValidateSet("elasticnet","hgb")]
+    [ValidateSet("elasticnet", "hgb")]
     [string]$Model = "elasticnet",
 
-    [ValidateSet("none","weight","sqrt_weight")]
+    [ValidateSet("none", "weight", "sqrt_weight")]
     [string]$WeightMode = "none",
 
     [switch]$Viz,
-    [switch]$SkipOOF,
+    [switch]$Validate,
+
     [switch]$SkipInstall,
     [switch]$SkipTests,
 
-    # ElasticNet
+    [string]$ArtifactsDir = "artifacts",
+    [string]$Tag = "",
+
     [double]$Alpha = 0.01,
     [double]$L1Ratio = 0.2,
+    [int]$MaxIter = 5000,
 
-    # HGB (note: set -HgbMaxDepth 0 to mean None)
     [double]$HgbLearningRate = 0.05,
-    [int]$HgbMaxIter = 400,
+    [int]$HgbMaxIter = 600,
     [int]$HgbMaxDepth = 6,
     [int]$HgbMinSamplesLeaf = 20,
     [double]$HgbL2Regularization = 0.0,
-
-    [string]$ArtifactsDir = "artifacts"
+    [switch]$HgbEarlyStopping
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-function Ensure-Dir([string]$p) {
-    if (-not (Test-Path -LiteralPath $p)) {
-        New-Item -ItemType Directory -Path $p | Out-Null
-    }
-}
+. (Join-Path $PSScriptRoot "_common.ps1")
 
-function Fmt([double]$x) {
-    return $x.ToString("g", [System.Globalization.CultureInfo]::InvariantCulture)
-}
-
-function Get-ElasticTag([string]$weightMode, [double]$alpha, [double]$l1) {
-    return "elasticnet_{0}_a{1}_l1{2}" -f $weightMode, (Fmt $alpha), (Fmt $l1)
-}
-
-function Get-HgbTag([string]$weightMode, [int]$maxIter, [double]$lr, [int]$depth, [int]$leaf, [double]$l2) {
-    # depth=0 means None; tag uses "None" just for readability
-    $dtag = if ($depth -eq 0) { "None" } else { "$depth" }
-    return "hgb_{0}_i{1}_lr{2}_d{3}_leaf{4}_l2{5}" -f $weightMode, $maxIter, (Fmt $lr), $dtag, $leaf, (Fmt $l2)
-}
-
-$root = Resolve-Path (Join-Path $PSScriptRoot "..")
+$root = Get-ProjectRoot
 Push-Location $root
-
 try {
+    $py = Ensure-Venv $root
+
     if (-not $SkipInstall) {
-        $bootstrap = Join-Path $PSScriptRoot "bootstrap.ps1"
-        if (Test-Path -LiteralPath $bootstrap) {
-            & $bootstrap | Out-Host
-        }
+        Write-Host "Installing project (editable, dev deps)..."
+        Install-Project $py
+    } else {
+        Write-Host "Skipping install."
     }
 
     if (-not $SkipTests) {
-        python -m pytest | Out-Host
+        Write-Host "Running tests..."
+        Run-Tests $py
+    } else {
+        Write-Host "Skipping tests."
     }
 
-    $tag = switch ($Model) {
-        "elasticnet" { Get-ElasticTag $WeightMode $Alpha $L1Ratio }
-        "hgb"        { Get-HgbTag $WeightMode $HgbMaxIter $HgbLearningRate $HgbMaxDepth $HgbMinSamplesLeaf $HgbL2Regularization }
-        default      { throw "Unknown model: $Model" }
+    if ($Validate) {
+        Write-Host "Running sanity validation (poverty.validate)..."
+        & $py -m poverty.validate --data-dir $DataDir
     }
 
-    $oofDir     = Join-Path $ArtifactsDir "oof"
-    $metricsDir = Join-Path (Join-Path $ArtifactsDir "metrics") $tag
-    $plotsDir   = Join-Path (Join-Path $ArtifactsDir "plots")   $tag
+    Ensure-Dir (Join-Path $ArtifactsDir "oof")
+    Ensure-Dir (Join-Path $ArtifactsDir "metrics")
+    Ensure-Dir (Join-Path $ArtifactsDir "plots")
 
-    Ensure-Dir $oofDir
-    Ensure-Dir $metricsDir
-    Ensure-Dir $plotsDir
-
-    $oofPath = Join-Path $oofDir ("{0}.csv" -f $tag)
-
-    if (-not $SkipOOF) {
-        Write-Host ""
-        Write-Host ("=== OOF: model={0} weight_mode={1} tag={2} ===" -f $Model, $WeightMode, $tag)
-
-        $args = @(
-            "-m","poverty.viz","oof",
-            "--data-dir",$DataDir,
-            "--model",$Model,
-            "--weight-mode",$WeightMode,
-            "--out",$oofPath
-        )
-
+    if ([string]::IsNullOrWhiteSpace($Tag)) {
         if ($Model -eq "elasticnet") {
-            $args += @("--alpha",(Fmt $Alpha),"--l1-ratio",(Fmt $L1Ratio))
+            $a = Format-FloatTag $Alpha
+            $l1 = Format-FloatTag $L1Ratio
+            $Tag = "elasticnet_${WeightMode}_a${a}_l1${l1}"
+        } elseif ($Model -eq "hgb") {
+            $lr = Format-FloatTag $HgbLearningRate
+            $l2 = Format-FloatTag $HgbL2Regularization
+            $d = if ($HgbMaxDepth -in 0, -1) { "None" } else { "$HgbMaxDepth" }
+            $Tag = "hgb_${WeightMode}_i${HgbMaxIter}_lr${lr}_d${d}_leaf${HgbMinSamplesLeaf}_l2${l2}"
+        } else {
+            throw "Unexpected Model=$Model"
         }
-
-        if ($Model -eq "hgb") {
-            $args += @(
-                "--hgb-learning-rate",(Fmt $HgbLearningRate),
-                "--hgb-max-iter","$HgbMaxIter",
-                "--hgb-max-depth","$HgbMaxDepth",
-                "--hgb-min-samples-leaf","$HgbMinSamplesLeaf",
-                "--hgb-l2-regularization",(Fmt $HgbL2Regularization)
-            )
-        }
-
-        python @args | Out-Host
-    }
-    else {
-        if (-not (Test-Path -LiteralPath $oofPath)) {
-            throw "SkipOOF was specified but OOF file does not exist: $oofPath"
-        }
-        Write-Host ""
-        Write-Host ("=== Reusing existing OOF: {0} ===" -f $oofPath)
     }
 
-    # Always compute metrics (no plots) so tuning scripts can parse a stable line.
+    $oofPath = Join-Path $ArtifactsDir ("oof\{0}.csv" -f $Tag)
+    $metricsPath = Join-Path $ArtifactsDir ("metrics\{0}.csv" -f $Tag)
+    $plotsDir = Join-Path $ArtifactsDir ("plots\{0}" -f $Tag)
+
     Write-Host ""
-    Write-Host ("=== Metrics (no plots): {0} ===" -f $tag)
+    Write-Host ("=== OOF: model={0} weight_mode={1} tag={2} ===" -f $Model, $WeightMode, $Tag)
 
-    python -m poverty.viz metrics --data-dir $DataDir --oof $oofPath --out-dir $metricsDir | Out-Host
+    $oofArgs = @(
+        "-m", "poverty.viz", "oof",
+        "--data-dir", $DataDir,
+        "--model", $Model,
+        "--weight-mode", $WeightMode,
+        "--out", $oofPath
+    )
+
+    if ($Model -eq "elasticnet") {
+        $oofArgs += @("--alpha", $Alpha, "--l1-ratio", $L1Ratio, "--max-iter", $MaxIter)
+    } elseif ($Model -eq "hgb") {
+        $oofArgs += @(
+            "--hgb-learning-rate", $HgbLearningRate,
+            "--hgb-max-iter", $HgbMaxIter,
+            "--hgb-max-depth", $HgbMaxDepth,
+            "--hgb-min-samples-leaf", $HgbMinSamplesLeaf,
+            "--hgb-l2-regularization", $HgbL2Regularization
+        )
+        if ($HgbEarlyStopping) {
+            $oofArgs += "--hgb-early-stopping"
+        }
+    }
+
+    & $py @oofArgs
 
     if ($Viz) {
+        Ensure-Dir $plotsDir
         Write-Host ""
-        Write-Host ("=== Plots: {0} ===" -f $tag)
-        python -m poverty.viz plots --data-dir $DataDir --oof $oofPath --out-dir $plotsDir --model-name $tag | Out-Host
+        Write-Host ("=== PLOTS: {0} ===" -f $plotsDir)
+
+        & $py -m poverty.viz plots `
+            --data-dir $DataDir `
+            --oof $oofPath `
+            --out-dir $plotsDir `
+            --model-name $Tag
+
+        Write-Host ""
         Write-Host ("OOF:   {0}" -f $oofPath)
         Write-Host ("Plots: {0}" -f $plotsDir)
-    }
-    else {
+    } else {
+        Write-Host ""
+        Write-Host ("=== METRICS: {0} ===" -f $metricsPath)
+
+        & $py -m poverty.viz metrics `
+            --data-dir $DataDir `
+            --oof $oofPath `
+            --out $metricsPath
+
+        Write-Host ""
         Write-Host ("OOF:     {0}" -f $oofPath)
-        Write-Host ("Metrics: {0}" -f $metricsDir)
+        Write-Host ("Metrics: {0}" -f $metricsPath)
     }
 }
 finally {

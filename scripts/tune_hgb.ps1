@@ -1,7 +1,7 @@
-[CmdletBinding()]
 param(
     [string]$DataDir = "data/raw",
-    [ValidateSet("none","weight","sqrt_weight")]
+
+    [ValidateSet("none", "weight", "sqrt_weight")]
     [string]$WeightMode = "none",
 
     [double[]]$LearningRates = @(0.03, 0.05, 0.08),
@@ -10,40 +10,41 @@ param(
     [int[]]$MinSamplesLeafs = @(10, 20, 50),
     [double[]]$L2Regs = @(0.0, 0.1),
 
-    [int]$MaxRuns = 0,     # 0 = all combos; otherwise stop after this many
+    [int]$MaxRuns = 0,
     [switch]$VizTop,
     [int]$TopK = 3,
 
-    [switch]$SkipInstall,
-    [switch]$SkipTests,
+    [bool]$SkipInstall = $true,
+    [bool]$SkipTests = $true,
 
-    [string]$ArtifactsDir = "artifacts"
+    [string]$ArtifactsDir = "artifacts",
+    [string]$OutCsv = ""
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
-function Fmt([double]$x) {
-    return $x.ToString("g", [System.Globalization.CultureInfo]::InvariantCulture)
-}
+. (Join-Path $PSScriptRoot "_common.ps1")
 
-function Ensure-Dir([string]$p) {
-    if (-not (Test-Path -LiteralPath $p)) {
-        New-Item -ItemType Directory -Path $p | Out-Null
-    }
-}
-
-$root = Resolve-Path (Join-Path $PSScriptRoot "..")
+$root = Get-ProjectRoot
 Push-Location $root
-
 try {
-    $resultsDir = Join-Path $ArtifactsDir "tuning"
-    Ensure-Dir $resultsDir
+    $py = Ensure-Venv $root
 
-    $stamp = Get-Date -Format "yyyyMMdd_HHmmss"
-    $outCsv = Join-Path $resultsDir ("hgb_sweep_{0}.csv" -f $stamp)
+    if (-not $SkipInstall) { Install-Project $py }
+    if (-not $SkipTests) { Run-Tests $py }
 
-    $rows = New-Object System.Collections.Generic.List[object]
+    Ensure-Dir (Join-Path $ArtifactsDir "tuning")
+    Ensure-Dir (Join-Path $ArtifactsDir "oof")
+    Ensure-Dir (Join-Path $ArtifactsDir "metrics")
+    Ensure-Dir (Join-Path $ArtifactsDir "plots")
+
+    if ([string]::IsNullOrWhiteSpace($OutCsv)) {
+        $stamp = (Get-Date).ToString("yyyyMMdd_HHmmss")
+        $OutCsv = Join-Path $ArtifactsDir ("tuning\hgb_sweep_{0}.csv" -f $stamp)
+    }
+
+    $results = New-Object System.Collections.Generic.List[object]
     $n = 0
 
     foreach ($lr in $LearningRates) {
@@ -52,46 +53,77 @@ try {
                 foreach ($leaf in $MinSamplesLeafs) {
                     foreach ($l2 in $L2Regs) {
 
-                        $n++
-                        if ($MaxRuns -gt 0 -and $n -gt $MaxRuns) { break }
+                        $lrTag = Format-FloatTag $lr
+                        $l2Tag = Format-FloatTag $l2
+                        $dTag = if ($d -in 0, -1) { "None" } else { "$d" }
+                        $tag = "hgb_${WeightMode}_i${it}_lr${lrTag}_d${dTag}_leaf${leaf}_l2${l2Tag}"
 
                         Write-Host ""
-                        Write-Host ("=== HGB sweep: lr={0} it={1} depth={2} leaf={3} l2={4} ===" -f (Fmt $lr), $it, $d, $leaf, (Fmt $l2))
+                        Write-Host ("=== HGB sweep: lr={0} it={1} depth={2} leaf={3} l2={4} ===" -f $lr, $it, $d, $leaf, $l2)
 
-                        $runArgs = @{
-                            DataDir              = $DataDir
-                            Model                = "hgb"
-                            WeightMode           = $WeightMode
-                            HgbLearningRate      = [double]$lr
-                            HgbMaxIter           = [int]$it
-                            HgbMaxDepth          = [int]$d
-                            HgbMinSamplesLeaf    = [int]$leaf
-                            HgbL2Regularization  = [double]$l2
-                            SkipInstall          = $SkipInstall
-                            SkipTests            = $SkipTests
-                            ArtifactsDir         = $ArtifactsDir
+                        $metricsPath = Join-Path $ArtifactsDir ("metrics\{0}.csv" -f $tag)
+
+                        try {
+                            & "$PSScriptRoot\run.ps1" `
+                                -DataDir $DataDir `
+                                -Model hgb `
+                                -WeightMode $WeightMode `
+                                -HgbLearningRate $lr `
+                                -HgbMaxIter $it `
+                                -HgbMaxDepth $d `
+                                -HgbMinSamplesLeaf $leaf `
+                                -HgbL2Regularization $l2 `
+                                -SkipInstall:([bool]$SkipInstall) `
+                                -SkipTests:([bool]$SkipTests) `
+                                -ArtifactsDir $ArtifactsDir `
+                                -Tag $tag | Out-Null
+                        }
+                        catch {
+                            Write-Warning ("Run failed for tag={0}. Error: {1}" -f $tag, $_.Exception.Message)
                         }
 
-                        $out = & "$PSScriptRoot\run.ps1" @runArgs 2>&1 | Out-String
+                        if (-not (Test-Path $metricsPath)) {
+                            Write-Warning "Missing metrics file. Marking as +Inf."
+                            $results.Add([pscustomobject]@{
+                                tag = $tag
+                                learning_rate = $lr
+                                max_iter = $it
+                                max_depth = $d
+                                min_samples_leaf = $leaf
+                                l2_regularization = $l2
+                                blended_mean = [double]::PositiveInfinity
+                                poverty_wmape_mean = [double]::PositiveInfinity
+                                household_mape_mean = [double]::PositiveInfinity
+                            }) | Out-Null
+                        } else {
+                            $rep = Import-Csv $metricsPath
+                            $meanRow = $rep | Where-Object { $_.survey_id -eq "MEAN" } | Select-Object -First 1
 
-                        $score = [double]::PositiveInfinity
-                        if ($out -match "MEAN_BLENDED=([0-9eE\+\-\.]+)") {
-                            $score = [double]$Matches[1]
+                            if (-not $meanRow) {
+                                Write-Warning "No MEAN row found. Marking as +Inf."
+                                $blended = [double]::PositiveInfinity
+                                $pwmape = [double]::PositiveInfinity
+                                $hmape = [double]::PositiveInfinity
+                            } else {
+                                $blended = [double]$meanRow.blended
+                                $pwmape = [double]$meanRow.poverty_wmape
+                                $hmape = [double]$meanRow.household_mape
+                            }
+
+                            $results.Add([pscustomobject]@{
+                                tag = $tag
+                                learning_rate = $lr
+                                max_iter = $it
+                                max_depth = $d
+                                min_samples_leaf = $leaf
+                                l2_regularization = $l2
+                                blended_mean = $blended
+                                poverty_wmape_mean = $pwmape
+                                household_mape_mean = $hmape
+                            }) | Out-Null
                         }
-                        else {
-                            Write-Warning "Could not parse MEAN_BLENDED from run output. Marking as +Inf."
-                        }
 
-                        $rows.Add([pscustomobject]@{
-                            blended_mean       = $score
-                            learning_rate      = [double]$lr
-                            max_iter           = [int]$it
-                            max_depth          = [int]$d
-                            min_samples_leaf   = [int]$leaf
-                            l2_regularization  = [double]$l2
-                            weight_mode        = $WeightMode
-                        }) | Out-Null
-
+                        $n++
                         if ($MaxRuns -gt 0 -and $n -ge $MaxRuns) { break }
                     }
                     if ($MaxRuns -gt 0 -and $n -ge $MaxRuns) { break }
@@ -103,39 +135,33 @@ try {
         if ($MaxRuns -gt 0 -and $n -ge $MaxRuns) { break }
     }
 
-    $sorted = $rows | Sort-Object blended_mean
-    $sorted | Export-Csv -NoTypeInformation -Path $outCsv
+    $sorted = $results | Sort-Object blended_mean, poverty_wmape_mean, household_mape_mean
+    $sorted | Export-Csv -NoTypeInformation $OutCsv
 
     Write-Host ""
-    Write-Host ("Wrote sweep results: {0}" -f $outCsv)
-
+    Write-Host ("Wrote sweep results: {0}" -f $OutCsv)
     Write-Host ""
-    Write-Host ("Top {0} runs (lower is better):" -f $TopK)
-    $sorted | Select-Object -First $TopK | Format-Table -AutoSize
+    $sorted | Select-Object -First 15 | Format-Table -AutoSize
 
     if ($VizTop) {
+        $k = [Math]::Max(1, $TopK)
         Write-Host ""
-        Write-Host ("Generating plots for TopK={0} (reusing existing OOF)..." -f $TopK)
+        Write-Host ("Generating plots for top {0} configurations..." -f $k)
 
-        $top = $sorted | Select-Object -First $TopK
-        foreach ($r in $top) {
-            $runArgs2 = @{
-                DataDir              = $DataDir
-                Model                = "hgb"
-                WeightMode           = $WeightMode
-                HgbLearningRate      = [double]$r.learning_rate
-                HgbMaxIter           = [int]$r.max_iter
-                HgbMaxDepth          = [int]$r.max_depth
-                HgbMinSamplesLeaf    = [int]$r.min_samples_leaf
-                HgbL2Regularization  = [double]$r.l2_regularization
-                SkipInstall          = $true
-                SkipTests            = $true
-                SkipOOF              = $true
-                Viz                  = $true
-                ArtifactsDir         = $ArtifactsDir
+        foreach ($r in ($sorted | Select-Object -First $k)) {
+            $tag = $r.tag
+            $oofPath = Join-Path $ArtifactsDir ("oof\{0}.csv" -f $tag)
+            $plotsDir = Join-Path $ArtifactsDir ("plots\{0}" -f $tag)
+            Ensure-Dir $plotsDir
+
+            if (-not (Test-Path $oofPath)) {
+                Write-Warning ("Missing OOF file for tag={0}; skipping plots." -f $tag)
+                continue
             }
 
-            & "$PSScriptRoot\run.ps1" @runArgs2 | Out-Host
+            Write-Host ""
+            Write-Host ("=== PLOTS (top): {0} ===" -f $tag)
+            & $py -m poverty.viz plots --data-dir $DataDir --oof $oofPath --out-dir $plotsDir --model-name $tag
         }
     }
 }
